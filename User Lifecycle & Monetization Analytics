@@ -1,0 +1,151 @@
+-- Funnel & Revenue Metrics
+-- Step 1: Filter key events from GA4 sample dataset
+WITH base_events AS (
+  SELECT
+    DATE(TIMESTAMP_MICROS(event_timestamp)) AS event_date,
+    user_pseudo_id AS user_id,
+    event_name,
+    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+    (SELECT value.double_value FROM UNNEST(event_params) WHERE key = 'value') AS revenue
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20200101' AND '20201231'
+    AND event_name IN ('page_view', 'view_item', 'add_to_cart', 'begin_checkout', 'purchase')
+),
+
+-- Step 2: Count total events per funnel stage
+event_counts AS (
+  SELECT
+    event_name,
+    COUNT(*) AS total_events,
+    COUNT(DISTINCT user_id) AS unique_users
+  FROM base_events
+  GROUP BY event_name
+),
+
+-- Step 3: Revenue summary from purchase events
+revenue_stats AS (
+  SELECT
+    COUNT(DISTINCT user_id) AS purchasers,
+    SUM(revenue) AS total_revenue,
+    AVG(revenue) AS avg_order_value
+  FROM base_events
+  WHERE event_name = 'purchase'
+)
+
+-- View funnel stages:
+SELECT * FROM event_counts;
+
+-- View revenue stats:
+-- SELECT * FROM revenue_stats;
+
+-- Step 4: Count retained users per day
+retention_counts AS (
+  SELECT
+    first_seen_date,
+    days_after,
+    COUNT(DISTINCT user_id) AS retained_users
+  FROM retention_base
+  GROUP BY first_seen_date, days_after
+),
+
+-- Step 5: Count total new users per day
+new_users AS (
+  SELECT
+    first_seen_date,
+    COUNT(DISTINCT user_id) AS new_users
+  FROM user_first_seen
+  GROUP BY first_seen_date
+)
+
+-- Final Output: Retention by cohort (Day 1, 7, 30)
+SELECT
+  r.first_seen_date,
+  r.days_after,
+  r.retained_users,
+  n.new_users,
+  ROUND(SAFE_DIVIDE(r.retained_users, n.new_users) * 100, 2) AS retention_rate_percent
+FROM retention_counts r
+JOIN new_users n USING (first_seen_date)
+ORDER BY first_seen_date, days_after;
+
+ARPU / ARPPU Calculation
+-- Step 1: Отримаємо загальну кількість користувачів і покупців
+WITH users AS (
+  SELECT DISTINCT user_pseudo_id AS user_id
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20200101' AND '20201231'
+),
+
+purchases AS (
+  SELECT
+    user_pseudo_id AS user_id,
+    (SELECT value.double_value FROM UNNEST(event_params) WHERE key = 'value') AS purchase_value
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20200101' AND '20201231'
+    AND event_name = 'purchase'
+),
+
+-- Step 2: Розрахунок суми доходу, ARPU і ARPPU
+metrics AS (
+  SELECT
+    COUNT(DISTINCT u.user_id) AS total_users,
+    COUNT(DISTINCT p.user_id) AS paying_users,
+    SUM(p.purchase_value) AS total_revenue
+  FROM users u
+  LEFT JOIN purchases p ON u.user_id = p.user_id
+)
+
+-- Final output
+SELECT
+  total_users,
+  paying_users,
+  total_revenue,
+  ROUND(SAFE_DIVIDE(total_revenue, total_users), 2) AS ARPU,
+  ROUND(SAFE_DIVIDE(total_revenue, paying_users), 2) AS ARPPU
+FROM metrics;
+
+DAU / MAU / Stickiness
+-- Step 1: Отримаємо активність користувачів по днях
+WITH daily_users AS (
+  SELECT
+    DATE(TIMESTAMP_MICROS(event_timestamp)) AS event_date,
+    user_pseudo_id AS user_id
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20200101' AND '20201231'
+  GROUP BY event_date, user_id
+),
+
+-- Step 2: DAU (Daily Active Users)
+dau AS (
+  SELECT
+    event_date,
+    COUNT(DISTINCT user_id) AS daily_active_users
+  FROM daily_users
+  GROUP BY event_date
+),
+
+-- Step 3: MAU (Monthly Active Users)
+mau AS (
+  SELECT
+    FORMAT_DATE('%Y-%m', event_date) AS month,
+    COUNT(DISTINCT user_id) AS monthly_active_users
+  FROM daily_users
+  GROUP BY month
+),
+
+-- Step 4: Stickiness = DAU / MAU
+stickiness AS (
+  SELECT
+    FORMAT_DATE('%Y-%m', d.event_date) AS month,
+    d.event_date,
+    d.daily_active_users,
+    m.monthly_active_users,
+    ROUND(SAFE_DIVIDE(d.daily_active_users, m.monthly_active_users), 4) AS stickiness_ratio
+  FROM dau d
+  JOIN mau m ON FORMAT_DATE('%Y-%m', d.event_date) = m.month
+)
+
+-- Final output
+SELECT * FROM stickiness
+ORDER BY event_date;
